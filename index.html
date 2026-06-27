@@ -637,9 +637,15 @@ function slug(s){ return String(s||'').toLowerCase().replace(/[^a-z0-9]+/g,''); 
 function badgeClassFor(status){ return STATUS_BADGE_CLASS[status] || 'badge-new'; }
 
 async function sha256(text){
-  const enc = new TextEncoder().encode(text);
-  const buf = await crypto.subtle.digest('SHA-256', enc);
-  return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,'0')).join('');
+  try{
+    if(window.crypto && crypto.subtle){
+      const enc = new TextEncoder().encode(text);
+      const buf = await crypto.subtle.digest('SHA-256', enc);
+      return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,'0')).join('');
+    }
+  }catch(e){ console.warn('crypto.subtle failed, using fallback'); }
+  let hash = 0; for(let i=0;i<text.length;i++){ hash = ((hash<<5)-hash)+text.charCodeAt(i); hash = hash & hash; }
+  return 'fb_'+Math.abs(hash).toString(16);
 }
 function randomRecoveryKey(){
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -653,8 +659,38 @@ function debounce(fn, ms){
 }
 
 /* ---------------------------------------------------------------------
-   3. DATA LAYER (localStorage)
+   3. DATA LAYER (Google Sheets - cross device)
    --------------------------------------------------------------------- */
+const SHEET_API = 'https://script.google.com/macros/s/AKfycbwrCGdjAzjwvpeO_7qbkinEjBbJTInUuRpfhQwkybFxgx9ngAm5c3FPERVGHdmGsMpofA/exec';
+
+async function apiGet(collection){
+  try{
+    const controller = new AbortController();
+    const t = setTimeout(()=>controller.abort(), 6000);
+    const res = await fetch(`${SHEET_API}?collection=${encodeURIComponent(collection)}&t=${Date.now()}`, {cache:'no-store', signal: controller.signal});
+    clearTimeout(t);
+    if(!res.ok) throw new Error('HTTP '+res.status);
+    const data = await res.json();
+    return Array.isArray(data) ? data : [];
+  }catch(e){
+    console.warn('Sheets fetch failed for', collection, e.message);
+    return [];
+  }
+}
+
+async function apiPost(action, collection, record){
+  try{
+    await fetch(SHEET_API, {
+      method: 'POST',
+      mode: 'no-cors',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({action, collection, record})
+    });
+  }catch(e){
+    console.error('apiPost failed', collection, e);
+  }
+}
+
 function defaultDB(){
   return {
     auth: { recoveryKeyHash: null },
@@ -668,43 +704,41 @@ function defaultDB(){
 
 let DB = null;
 
-function loadDB(){
+async function loadDB(){
+  DB = defaultDB();
   try{
-    const raw = localStorage.getItem(DB_KEY);
-    DB = raw ? JSON.parse(raw) : defaultDB();
+    const cols = ['leads','closers','deliveryPartners','freelancers','clients','projects','users','activities','notifications'];
+    await Promise.all(cols.map(async c => {
+      const data = await apiGet(c);
+      DB[c] = data;
+    }));
+    const countersData = await apiGet('counters');
+    if(countersData && countersData.length){
+      countersData.forEach(r => {
+        const name = r.id || r.name;
+        if(name) DB.counters[name] = Number(r.value) || 0;
+      });
+    }
+    const authData = await apiGet('auth');
+    if(authData && authData.length && authData[0].recoveryKeyHash){
+      DB.auth.recoveryKeyHash = authData[0].recoveryKeyHash;
+    }
   }catch(e){
-    console.error('DB load failed, resetting', e);
-    DB = defaultDB();
+    console.error('loadDB error', e);
   }
-  // schema patch for forward-compat
-  const d = defaultDB();
-  for(const k in d){ if(!(k in DB)) DB[k] = d[k]; }
-  for(const k in d.counters){ if(!(k in DB.counters)) DB.counters[k] = d.counters[k]; }
+  for(const k of ['leads','closers','deliveryPartners','freelancers','clients','projects','users','activities','notifications']){
+    if(!Array.isArray(DB[k])) DB[k] = [];
+  }
   return DB;
 }
-function saveDB(){
-    const scriptURL = 'https://script.google.com/macros/s/AKfycbxB8sSFtjvwcZ2YRioP1r6QhgbdQWrMHhJov0glfdbOETtoLK8wJuWUYJpJwuMq5elJUw/exec';
 
-  fetch(scriptURL, {
-      method: 'POST',
-      mode: 'no-cors',
-      cache: 'no-cache',
-      headers: {
-          'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(DB) 
-  })
-  .then(response => {
-      console.log('Success: Saved to Google Sheets');
-      localStorage.setItem(DB_KEY, JSON.stringify(DB));
-  })
-  .catch(error => {
-      console.error('Error:', error.message);
-  });
+function saveDB(){
+  // no-op: writes go directly to Sheets
 }
+
 function nextCounter(name){
   DB.counters[name] = (DB.counters[name]||0) + 1;
-  saveDB();
+  apiPost('upsert','counters',{id:name, name:name, value:DB.counters[name]});
   return DB.counters[name];
 }
 function nextTrackingId(){
@@ -717,29 +751,31 @@ function pad(n, width){ return String(n).padStart(width,'0'); }
 function getAll(coll){ return DB[coll] || []; }
 function getById(coll, id){ return getAll(coll).find(x => x.id === id); }
 function upsert(coll, record){
-  const arr = DB[coll];
+  const arr = DB[coll] = DB[coll] || [];
   const idx = arr.findIndex(x => x.id === record.id);
   if(idx >= 0) arr[idx] = record; else arr.push(record);
-  saveDB();
+  apiPost('upsert', coll, record);
 }
 function removeById(coll, id){
-  DB[coll] = DB[coll].filter(x => x.id !== id);
-  saveDB();
+  DB[coll] = (DB[coll]||[]).filter(x => x.id !== id);
+  apiPost('delete', coll, {id});
 }
 
 /* ---------------------------------------------------------------------
    4. ACTIVITY LOG + NOTIFICATIONS + TOASTS
    --------------------------------------------------------------------- */
 function logActivity(type, message){
-  DB.activities.unshift({ id: uid('act'), type, message, timestamp: new Date().toISOString() });
+  const act = { id: uid('act'), type, message, timestamp: new Date().toISOString() };
+  DB.activities.unshift(act);
   if(DB.activities.length > 100) DB.activities = DB.activities.slice(0,100);
-  saveDB();
-  if(document.getElementById('view-activity').classList.contains('active')) renderActivityView();
+  apiPost('upsert','activities', act);
+  if(document.getElementById('view-activity')?.classList.contains('active')) renderActivityView();
 }
 function pushNotification(message, type){
-  DB.notifications.unshift({ id: uid('notif'), message, type: type||'info', read:false, timestamp: new Date().toISOString() });
+  const notif = { id: uid('notif'), message, type: type||'info', read:false, timestamp: new Date().toISOString() };
+  DB.notifications.unshift(notif);
   if(DB.notifications.length > 60) DB.notifications = DB.notifications.slice(0,60);
-  saveDB();
+  apiPost('upsert','notifications', notif);
   renderNotifDot();
 }
 function toast(message, type){
@@ -793,9 +829,9 @@ async function ensureBootstrap(){
   if(DB.users.length === 0){
     const key = randomRecoveryKey();
     DB.auth.recoveryKeyHash = await sha256(key);
+    apiPost('upsert','auth',{id:'main', recoveryKeyHash: DB.auth.recoveryKeyHash});
     await createUserRecord({ role:'admin', loginId:'admin', password:'elithnic123', name:'Admin' });
     await generateDemoData();
-    saveDB();
     return key;
   }
   return null;
@@ -3140,7 +3176,7 @@ function wireStaticEvents(){
 }
 
 async function bootstrap(){
-  loadDB();
+  try{ await loadDB(); }catch(e){ console.error(e); }
   const firstRunKey = await ensureBootstrap();
   wireStaticEvents();
 
